@@ -1,0 +1,12 @@
+# CCS 构建输出
+Debug/
+
+# 编译产物
+*.o
+*.obj
+*.out
+*.map
+*.d
+
+# clangd 缓存
+.clangd/.cache/

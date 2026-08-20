@@ -1,0 +1,429 @@
+#include "ti_msp_dl_config.h"
+
+/* ==================== 参数定义 ==================== */
+/* 电机速度（PWM比较值，定时器周期4000） */
+#define MOTOR_BASE   1000
+#define MOTOR_MIN    10
+#define MOTOR_MAX    3500
+
+/* 灰度阈值（12位ADC，0-4095，黑线读数 < 阈值 = 检测到黑线） */
+#define GRAY_THRESHOLD  2000
+
+/* 直角转弯参数 */
+#define TURN_SPEED       1000   /* 转弯时的PWM速度 */
+#define TURN_DURATION_MS 300    /* 直角转弯持续时间（需根据实际调试） */
+
+/* PID参数 */
+#define PID_KP  13
+#define PID_KI  1
+#define PID_KD  5
+#define PID_INTEGRAL_MAX  50
+#define PID_OUTPUT_MAX    800
+
+/* 引脚别名 */
+#define A1_PIN   GPIO_AIN_1_PIN_0_PIN
+#define A1_PORT  GPIO_AIN_1_PORT
+#define A2_PIN   GPIO_AIN_2_PIN_1_PIN
+#define A2_PORT  GPIO_AIN_2_PORT
+#define D1_PIN   GPIO_DIN_1_PIN_6_PIN
+#define D1_PORT  GPIO_DIN_1_PORT
+#define D2_PIN   GPIO_DIN_2_PIN_7_PIN
+#define D2_PORT  GPIO_DIN_2_PORT
+#define STBY_P   GPIO_STBY_PIN_8_PIN
+#define STBY_PT  GPIO_STBY_PORT
+#define AD0_PIN  GPIO_AD0_PIN_9_PIN
+#define AD0_PORT GPIO_AD0_PORT
+#define AD1_PIN  GPIO_AD1_PIN_10_PIN
+#define AD1_PORT GPIO_AD1_PORT
+#define AD2_PIN  GPIO_AD2_PIN_11_PIN
+#define AD2_PORT GPIO_AD2_PORT
+
+/* UART 调试串口 — 由 SysConfig 初始化 UART0, PA.28(TX)/PA.31(RX), 9600 */
+#define UART_DBG             UART0
+#define UART_PRINT_INTERVAL  500  /* 每500次主循环（约500ms）打印一次 */
+
+/* ==================== 函数声明 ==================== */
+void delay_us(uint32_t us);
+void delay_ms(uint32_t ms);
+void set_mux_channel(uint8_t ch);
+uint8_t  read_gray_channel(uint8_t ch);
+int16_t  calculate_error(uint8_t s[8]);
+int16_t  pid_compute(int16_t error);
+void     motor_set_speed(int32_t left, int32_t right);
+void     motor_stop(void);
+void     motor_turn_right(void);
+void     motor_turn_left(void);
+void     uart_putc(char c);
+void     uart_puts(const char *s);
+void     uart_puti(int32_t n);
+
+/* ==================== 全局变量 ==================== */
+volatile int16_t g_pid_integral    = 0;
+volatile int16_t g_pid_last_error  = 0;
+volatile int16_t g_last_valid_error = 0;
+
+/* 调试变量（用 CCS Watch 窗口观察） */
+volatile uint16_t g_adc_raw[8]       = {0};
+volatile int16_t  g_error_debug      = 0;
+volatile int16_t  g_pid_debug        = 0;
+volatile int32_t  g_left_speed_debug  = 0;
+volatile int32_t  g_right_speed_debug = 0;
+
+/* ==================== 主函数 ==================== */
+int main(void)
+{
+    SYSCFG_DL_init();
+
+    /* PA27 模拟功能 — 必须在 ADC 初始化之后、使用之前调用 */
+    DL_GPIO_initPeripheralAnalogFunction(GPIO_ADC_FD_IOMUX_C0);
+    /* 再次确认 ADC 转换使能 */
+    DL_ADC12_enableConversions(ADC_FD_INST);
+
+    /* 使能电机驱动芯片 */
+    DL_GPIO_setPins(STBY_PT, STBY_P);
+
+    /*
+     * UART 由 SysConfig 初始化（UART0, PA.28 TX / PA.31 RX, 9600 8N1）。
+     * ADC 由 SysConfig 初始化（ADC0, PA.27, CHAN_0, AUTO_NEXT）。
+     */
+
+    uart_puts("\r\n=== Car Ready ===\r\n");
+
+    /* 循迹模式：切换到 TRIGGER_NEXT 单次触发 */
+    DL_ADC12_disableConversions(ADC_FD_INST);
+    DL_ADC12_configConversionMem(ADC_FD_INST, ADC_FD_ADCMEM_0,
+        DL_ADC12_INPUT_CHAN_0, DL_ADC12_REFERENCE_VOLTAGE_VDDA,
+        DL_ADC12_SAMPLE_TIMER_SOURCE_SCOMP0, DL_ADC12_AVERAGING_MODE_DISABLED,
+        DL_ADC12_BURN_OUT_SOURCE_DISABLED, DL_ADC12_TRIGGER_MODE_TRIGGER_NEXT,
+        DL_ADC12_WINDOWS_COMP_MODE_DISABLED);
+    DL_ADC12_enableConversions(ADC_FD_INST);
+
+    /* ============================================================
+     * 测试模式开关：改 #if 1 恢复硬件诊断，改 #if 0 恢复循迹。
+     * ============================================================ */
+#if 1
+    uart_puts("=== ADC CHANNEL SCAN TEST ===\r\n");
+    uart_puts("Testing each CD4051 channel with ADC read\r\n\r\n");
+
+    while (1) {
+        uart_puts("CH: ");
+        for (uint8_t ch = 0; ch < 8; ch++) {
+            set_mux_channel(ch);
+            delay_ms(10);  /* 等待 CD4051 输出稳定 */
+
+            DL_ADC12_startConversion(ADC_FD_INST);
+            while (DL_ADC12_getStatus(ADC_FD_INST) & DL_ADC12_STATUS_CONVERSION_ACTIVE) {
+                __NOP();
+            }
+            uint16_t val = DL_ADC12_getMemResult(ADC_FD_INST, DL_ADC12_MEM_IDX_0);
+            uart_puti(ch); uart_putc('='); uart_puti(val); uart_puts("  ");
+        }
+        uart_puts("\r\n");
+        delay_ms(1000);
+    }
+#else
+    while (1) {
+        uint8_t s[8];
+        static uint32_t tick = 0;
+
+        /* 读取8路灰度传感器 */
+        for (int i = 0; i < 8; i++) {
+            s[i] = read_gray_channel(i);
+        }
+
+        /* 统计检测到黑线的传感器数量 */
+        uint8_t black_count = s[0] + s[1] + s[2] + s[3] + s[4] + s[5] + s[6] + s[7];
+
+        /* 没有检测到黑线（传感器无输出）→ 停车 */
+        if (black_count == 0) {
+            motor_stop();
+            g_pid_integral = 0;
+            g_pid_last_error = 0;
+
+            tick++;
+            if (tick % UART_PRINT_INTERVAL == 0) {
+                uart_puts("STOP: S=");
+                for (int i = 0; i < 8; i++) { uart_putc(s[i] ? '1' : '0'); }
+                uart_puts(" ADC:");
+                for (int i = 0; i < 8; i++) { uart_puti(g_adc_raw[i]); uart_putc(' '); }
+                uart_puts("\r\n");
+            }
+
+            delay_ms(1);
+            continue;
+        }
+
+        /* 检测到黑线 → 循迹：计算偏差 */
+        int16_t error = calculate_error(s);
+        g_error_debug = error;
+
+        /* PID 控制 */
+        int16_t pid_out = pid_compute(error);
+        g_pid_debug = pid_out;
+
+        /* 差速：左轮 = 基础 + PID，右轮 = 基础 - PID */
+        int32_t left_speed  = MOTOR_BASE + pid_out;
+        int32_t right_speed = MOTOR_BASE - pid_out;
+
+        /* 限幅 */
+        if (left_speed  < MOTOR_MIN) left_speed  = MOTOR_MIN;
+        if (left_speed  > MOTOR_MAX) left_speed  = MOTOR_MAX;
+        if (right_speed < MOTOR_MIN) right_speed = MOTOR_MIN;
+        if (right_speed > MOTOR_MAX) right_speed = MOTOR_MAX;
+
+        g_left_speed_debug  = left_speed;
+        g_right_speed_debug = right_speed;
+
+        motor_set_speed(left_speed, right_speed);
+
+        /* 周期打印调试信息 */
+        tick++;
+        if (tick % UART_PRINT_INTERVAL == 0) {
+            uart_puts("RUN: S=");
+            for (int i = 0; i < 8; i++) { uart_putc(s[i] ? '1' : '0'); }
+            uart_puts(" err=");  uart_puti(error);
+            uart_puts(" pid=");  uart_puti(pid_out);
+            uart_puts(" L=");    uart_puti(left_speed);
+            uart_puts(" R=");    uart_puti(right_speed);
+            uart_puts(" ADC:");
+            for (int i = 0; i < 8; i++) { uart_puti(g_adc_raw[i]); uart_putc(' '); }
+            uart_puts("\r\n");
+        }
+
+        delay_ms(1);
+    }
+#endif
+}
+
+/* ==================== 延时函数 ==================== */
+void delay_us(uint32_t us) {
+    uint32_t cycles = us * 40;
+    while (cycles--) { __NOP(); }
+}
+
+void delay_ms(uint32_t ms) {
+    uint32_t cycles = ms * 40000;
+    while (cycles--) { __NOP(); }
+}
+
+/* ==================== CD4051 通道切换 ==================== */
+void set_mux_channel(uint8_t ch) {
+    uint8_t bits = ch & 0x07;
+
+    if (bits & 0x01) DL_GPIO_setPins(AD0_PORT, AD0_PIN);
+    else             DL_GPIO_clearPins(AD0_PORT, AD0_PIN);
+
+    if (bits & 0x02) DL_GPIO_setPins(AD1_PORT, AD1_PIN);
+    else             DL_GPIO_clearPins(AD1_PORT, AD1_PIN);
+
+    if (bits & 0x04) DL_GPIO_setPins(AD2_PORT, AD2_PIN);
+    else             DL_GPIO_clearPins(AD2_PORT, AD2_PIN);
+}
+
+/* ==================== 灰度传感器读取 ==================== */
+/*
+ * TRIGGER_NEXT 模式，无竞态：
+ *   1. 切换CD4051通道 + 等待稳定
+ *   2. startConversion → 单次转换
+ *   3. 轮询 BUSY → 等待完成
+ *   4. 读取结果（无覆盖风险）
+ *   5. 重复 4 次取均值
+ */
+#define ADC_SAMPLE_COUNT  4
+
+uint8_t read_gray_channel(uint8_t ch) {
+    uint32_t sum = 0;
+
+    /* 切换CD4051通道（只切一次，不在采样循环内重复切换） */
+    set_mux_channel(ch);
+    delay_us(50);  /* 等待 CD4051 输出稳定 */
+
+    for (uint8_t n = 0; n < ADC_SAMPLE_COUNT; n++) {
+        /* 软件触发单次转换 */
+        DL_ADC12_startConversion(ADC_FD_INST);
+
+        /* 等待转换完成（TRIGGER_NEXT 不会自动重启，无竞态） */
+        while (DL_ADC12_getStatus(ADC_FD_INST) & DL_ADC12_STATUS_CONVERSION_ACTIVE) {
+            __NOP();
+        }
+
+        sum += DL_ADC12_getMemResult(ADC_FD_INST, DL_ADC12_MEM_IDX_0);
+    }
+
+    uint16_t avg = (uint16_t)(sum / ADC_SAMPLE_COUNT);
+
+    /* 调试：均值存入 g_adc_raw[]，可在 CCS Watch 窗口观察 */
+    g_adc_raw[ch] = avg;
+
+    return (avg < GRAY_THRESHOLD) ? 1 : 0;
+}
+
+/* ==================== 偏差计算 ==================== */
+/*
+ * 8路传感器加权：
+ *   左 ←  s0  s1  s2  s3  s4  s5  s6  s7  → 右
+ *   权重 -4  -3  -2  -1  +1  +2  +3  +4
+ *
+ * 返回值 > 0：黑线偏右，车应右转
+ * 返回值 < 0：黑线偏左，车应左转
+ *
+ * 全白（count==0）：保持上次有效方向
+ */
+int16_t calculate_error(uint8_t s[8]) {
+    int16_t count = s[0] + s[1] + s[2] + s[3] + s[4] + s[5] + s[6] + s[7];
+
+    if (count > 0) {
+        int16_t error = (-4*s[0] -3*s[1] -2*s[2] -1*s[3]
+                         +1*s[4] +2*s[5] +3*s[6] +4*s[7]) * 10 / count;
+        g_last_valid_error = error;
+        return error;
+    } else {
+        /* 全白：保持上次方向 */
+        if (g_last_valid_error != 0) {
+            return (g_last_valid_error > 0) ? 40 : -40;
+        }
+        return 0;
+    }
+}
+
+/* ==================== PID 控制器 ==================== */
+int16_t pid_compute(int16_t error) {
+    /* 比例项 */
+    int16_t p_term = PID_KP * error;
+
+    /* 积分项（带积分分离 & 限幅） */
+    g_pid_integral += error;
+    if (g_pid_integral > PID_INTEGRAL_MAX)  g_pid_integral = PID_INTEGRAL_MAX;
+    if (g_pid_integral < -PID_INTEGRAL_MAX) g_pid_integral = -PID_INTEGRAL_MAX;
+    int16_t i_term = PID_KI * g_pid_integral;
+
+    /* 微分项 */
+    int16_t d_term = PID_KD * (error - g_pid_last_error);
+    g_pid_last_error = error;
+
+    int16_t output = p_term + i_term + d_term;
+
+    if (output > PID_OUTPUT_MAX)  output = PID_OUTPUT_MAX;
+    if (output < -PID_OUTPUT_MAX) output = -PID_OUTPUT_MAX;
+
+    return output;
+}
+
+/* ==================== 电机驱动 ==================== */
+void motor_set_speed(int32_t left_speed, int32_t right_speed) {
+    /* 确保 STBY 使能 */
+    DL_GPIO_setPins(STBY_PT, STBY_P);
+
+    /* 左电机前进方向（A1=H, A2=L） */
+    DL_GPIO_setPins(A1_PORT, A1_PIN);
+    DL_GPIO_clearPins(A2_PORT, A2_PIN);
+
+    /* 右电机前进方向（D1=H, D2=L） */
+    DL_GPIO_setPins(D1_PORT, D1_PIN);
+    DL_GPIO_clearPins(D2_PORT, D2_PIN);
+
+    /* 设置 PWM 占空比 */
+    DL_TimerA_setCaptureCompareValue(PWM_DJ_A_INST, (uint32_t)left_speed,  DL_TIMER_CC_0_INDEX);
+    DL_TimerG_setCaptureCompareValue(PWM_DJ_D_INST, (uint32_t)right_speed, DL_TIMER_CC_1_INDEX);
+
+    /* 启动计数器 */
+    DL_TimerA_startCounter(PWM_DJ_A_INST);
+    DL_TimerG_startCounter(PWM_DJ_D_INST);
+}
+
+void motor_stop(void) {
+    DL_TimerA_stopCounter(PWM_DJ_A_INST);
+    DL_TimerG_stopCounter(PWM_DJ_D_INST);
+
+    DL_GPIO_clearPins(A1_PORT, A1_PIN);
+    DL_GPIO_clearPins(A2_PORT, A2_PIN);
+    DL_GPIO_clearPins(D1_PORT, D1_PIN);
+    DL_GPIO_clearPins(D2_PORT, D2_PIN);
+    DL_GPIO_clearPins(STBY_PT, STBY_P);
+}
+
+/* ==================== 直角右转（全黑时触发） ==================== */
+/* 左轮正转，右轮反转，实现原地右转 */
+void motor_turn_right(void) {
+    DL_GPIO_setPins(STBY_PT, STBY_P);
+
+    /* 左电机正转（A1=H, A2=L） */
+    DL_GPIO_setPins(A1_PORT, A1_PIN);
+    DL_GPIO_clearPins(A2_PORT, A2_PIN);
+
+    /* 右电机反转（D1=L, D2=H） */
+    DL_GPIO_clearPins(D1_PORT, D1_PIN);
+    DL_GPIO_setPins(D2_PORT, D2_PIN);
+
+    /* 设置转弯速度 */
+    DL_TimerA_setCaptureCompareValue(PWM_DJ_A_INST, (uint32_t)TURN_SPEED, DL_TIMER_CC_0_INDEX);
+    DL_TimerG_setCaptureCompareValue(PWM_DJ_D_INST, (uint32_t)TURN_SPEED, DL_TIMER_CC_1_INDEX);
+
+    DL_TimerA_startCounter(PWM_DJ_A_INST);
+    DL_TimerG_startCounter(PWM_DJ_D_INST);
+
+    delay_ms(TURN_DURATION_MS);
+}
+
+/* ==================== 直角左转（全白时触发） ==================== */
+/* 左轮反转，右轮正转，实现原地左转 */
+void motor_turn_left(void) {
+    DL_GPIO_setPins(STBY_PT, STBY_P);
+
+    /* 左电机反转（A1=L, A2=H） */
+    DL_GPIO_clearPins(A1_PORT, A1_PIN);
+    DL_GPIO_setPins(A2_PORT, A2_PIN);
+
+    /* 右电机正转（D1=H, D2=L） */
+    DL_GPIO_setPins(D1_PORT, D1_PIN);
+    DL_GPIO_clearPins(D2_PORT, D2_PIN);
+
+    /* 设置转弯速度 */
+    DL_TimerA_setCaptureCompareValue(PWM_DJ_A_INST, (uint32_t)TURN_SPEED, DL_TIMER_CC_0_INDEX);
+    DL_TimerG_setCaptureCompareValue(PWM_DJ_D_INST, (uint32_t)TURN_SPEED, DL_TIMER_CC_1_INDEX);
+
+    DL_TimerA_startCounter(PWM_DJ_A_INST);
+    DL_TimerG_startCounter(PWM_DJ_D_INST);
+
+    delay_ms(TURN_DURATION_MS);
+}
+
+/* ==================== UART 串口调试 ==================== */
+/*
+ * 天猛星 UART0 由 SysConfig 初始化：
+ *   PA.28(TX) / PA.31(RX), 9600 8N1
+ * 串口助手设置：波特率 9600
+ */
+void uart_putc(char c) {
+    DL_UART_Main_transmitDataBlocking(UART_DBG, (uint8_t)c);
+}
+
+void uart_puts(const char *s) {
+    while (*s) {
+        uart_putc(*s++);
+    }
+}
+
+void uart_puti(int32_t n) {
+    char buf[12];
+    int i = 0;
+
+    if (n < 0) {
+        uart_putc('-');
+        n = -n;
+    }
+
+    if (n == 0) {
+        uart_putc('0');
+        return;
+    }
+
+    while (n > 0) {
+        buf[i++] = '0' + (n % 10);
+        n /= 10;
+    }
+
+    while (i > 0) {
+        uart_putc(buf[--i]);
+    }
+}
